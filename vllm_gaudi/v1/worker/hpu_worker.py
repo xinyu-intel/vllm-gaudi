@@ -21,7 +21,7 @@ from vllm.distributed import (ensure_model_parallel_initialized, init_distribute
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.model_executor import set_random_seed
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec)
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.utils import is_fake_hpu
@@ -180,6 +180,8 @@ class HPUWorker(WorkerBase):
 
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
 
+            elif isinstance(layer_spec, MambaSpec):
+                pass
             else:
                 raise NotImplementedError
 
@@ -231,9 +233,13 @@ class HPUWorker(WorkerBase):
         with HabanaMemoryProfiler() as m:
             self.model_runner.initialize_kv_cache(kv_cache_config)
             torch.hpu.synchronize()
+        try:
+            kv_cache_shape = self.model_runner.kv_caches[0][0].shape[0]
+        except:
+            kv_cache_shape = None
         msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "
                f"actual allocated num_blocks: "
-               f"{self.model_runner.kv_caches[0][0].shape[0]} "
+               f"{kv_cache_shape} "
                f"(_PAD_BLOCK_ID={self.model_runner._PAD_BLOCK_ID}, "
                f"_PAD_SLOT_ID={self.model_runner._PAD_SLOT_ID})")
         logger.info(msg)
