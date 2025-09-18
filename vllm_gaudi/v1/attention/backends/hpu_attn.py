@@ -47,6 +47,31 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     context_lens_tensor: Optional[torch.Tensor]
     query_start_loc: Optional[torch.Tensor] = None
 
+    # GDNAttentionMetadata
+    num_prefills: Optional[int] = None
+    num_prefill_tokens: Optional[int] = None
+    num_decodes: Optional[int] = None
+    num_decode_tokens: Optional[int] = None
+    num_spec_decodes: Optional[int] = None
+    num_spec_decode_tokens: Optional[int] = None
+
+    has_initial_state: Optional[torch.Tensor] = None
+
+    spec_query_start_loc: Optional[torch.Tensor] = None  # shape: [num_spec_decodes + 1,]
+    non_spec_query_start_loc: Optional[torch.Tensor] = None  # shape: [batch - num_spec_decodes + 1,]
+
+    spec_state_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch, num_spec]
+    non_spec_state_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch - num_spec_decodes,]
+    spec_sequence_masks: Optional[torch.Tensor] = None  # shape: [batch,]
+    spec_token_masks: Optional[torch.Tensor] = None  # shape: [num_prefill_tokens + num_decode_tokens,]
+    num_accepted_tokens: Optional[torch.Tensor] = None  # shape: [batch,]
+
+    def attach_gdn_attention_metadata(self):
+        # Support only non-spec version
+        self.has_initial_state = self.context_lens_tensor > 0 if self.is_prompt else None
+        self.non_spec_query_start_loc = self.query_start_loc
+        self.non_spec_state_indices_tensor = self.block_list.view(self.slot_mapping.size(0), -1)[:, 0]
+
     def seq_len(self):
         return self.slot_mapping.size(-1)
 
@@ -64,7 +89,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               slot_mapping,
                               block_size,
                               query_start_loc=None):
-        return cls(
+        obj = cls(
             is_prompt=True,
             block_list=block_list,
             block_mapping=None,
@@ -83,6 +108,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
             enable_kv_scales_calculation=False,
             block_size=block_size,
             query_start_loc=query_start_loc)
+        # obj.attach_gdn_attention_metadata()
+        return obj
 
     @classmethod
     def make_decode_metadata(cls,
@@ -94,7 +121,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              slot_mapping,
                              block_size,
                              query_start_loc=None):
-        return cls(
+        obj = cls(
             is_prompt=False,
             block_mapping=None,
             alibi_blocks=None,
@@ -113,6 +140,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
             enable_kv_scales_calculation=False,
             block_size=block_size,
             query_start_loc=query_start_loc)
+        # obj.attach_gdn_attention_metadata()
+        return obj
 
 
 class HPUAttentionMetadataV1Builder:

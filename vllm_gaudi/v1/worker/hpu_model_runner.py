@@ -49,9 +49,7 @@ from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, cdiv, is_pin_memory_available, LazyLoader)
 from vllm_gaudi.utils import (HPUCompileConfig, is_fake_hpu, async_h2d_copy)
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
-from vllm.v1.attention.backends.mamba_selectors import get_mamba_attn_backend
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheSpec, KVCacheTensor,
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, KVCacheTensor,
                                         MambaSpec)
 from vllm.v1.worker.kv_connector_model_runner_mixin import (KVConnectorModelRunnerMixin)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors, DraftTokenIds, ModelRunnerOutput,
@@ -1672,35 +1670,12 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                                      block_list=context_blocks_t,
                                                                      attn_bias=attn_bias,
                                                                      block_size=self.block_size)
-        # TODO: Change to correct values if needed
-        query_start_loc = None
-        query_start_loc_cpu = None
-        seq_lens_cpu = None
-        total_num_scheduled_tokens = 0
-        max_num_scheduled_tokens = 1
-        max_seq_len = 1
-        # Correct values
-
-        common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=query_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            num_computed_tokens_cpu=context_lens.cpu(),
-            num_reqs=len(req_ids),
-            num_actual_tokens=total_num_scheduled_tokens,
-            max_query_len=max_num_scheduled_tokens,
-            max_seq_len=max_seq_len,
-            block_table_tensor=context_blocks_t,
-            slot_mapping=token_slots,
-            causal=True,
-        )
 
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
                                 position_ids=[token_positions],
-                                attn_metadata=[common_attn_metadata],
+                                attn_metadata=[attn_metadata],
                                 logits_indices=[logits_indices],
                                 logits_requests=[logits_requests])
 
@@ -1968,19 +1943,21 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
+        attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
+            block_list=block_list_device,
+            block_usage=block_usage_device,
+            block_groups=block_groups_device,
+            input_positions=None,
+            num_decode_tokens=num_decode_tokens_device,
+            slot_mapping=slot_mapping_device,
+            block_size=self.block_size,
+        )
+
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
                                position_ids=positions_device,
                                logits_indices=logits_indices_device,
-                               attn_metadata=HPUAttentionMetadataV1.make_decode_metadata(
-                                   block_list=block_list_device,
-                                   block_usage=block_usage_device,
-                                   block_groups=block_groups_device,
-                                   input_positions=None,
-                                   num_decode_tokens=num_decode_tokens_device,
-                                   slot_mapping=slot_mapping_device,
-                                   block_size=self.block_size,
-                               ),
+                               attn_metadata=attn_metadata,
                                spec_decode_metadata=spec_decode_metadata)
 
     def _prepare_decode_inputs(self,
@@ -3770,14 +3747,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
         for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-            if isinstance(kv_cache_spec, AttentionSpec):
-                attn_backends = get_attn_backends_for_layers(kv_cache_group_spec.layer_names)
-            # TODO(lucas): move `get_mamba_attn_backend` into the mamba
-            # layers like above
-            elif isinstance(kv_cache_spec, MambaSpec):
-                attn_backends = {get_mamba_attn_backend(kv_cache_spec.mamba_type): kv_cache_group_spec.layer_names}
-            else:
-                raise ValueError(f"Unknown KV cache spec type: {type(kv_cache_spec)}")
+            attn_backends = get_attn_backends_for_layers(kv_cache_group_spec.layer_names)
 
             logger.info(f"Got attn_backends {attn_backends}")
             self.attn_groups.append(create_attn_groups(attn_backends, kv_cache_spec))
