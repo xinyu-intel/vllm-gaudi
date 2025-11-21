@@ -1712,7 +1712,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             if len(content.req_ids) > 0:
                 num_real_prefill_batches += 1
 
-        num_pad_across_dp = self.get_dp_padding(num_real_prefill_batches)
+        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
+            num_pad_across_dp = 0
+        else:
+            num_pad_across_dp = self.get_dp_padding(num_real_prefill_batches)
         return all_batch_contents, num_pad_across_dp
 
     def _make_attn_bias(self, context_groups, token_groups):
@@ -1758,9 +1761,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         has_context = sum(context_lens) > 0
         target_bs, target_seq, target_blocks = self._get_prompt_bucketing_fn()(query_lens, num_context_blocks)
 
-        target_bs += self.get_dp_padding(target_bs)
-        target_seq += self.get_dp_padding(target_seq)
-        target_blocks += self.get_dp_padding(target_blocks)
+        if not (has_kv_transfer_group() and self.vllm_config.kv_transfer_config.kv_role == "kv_consumer"):
+            target_bs += self.get_dp_padding(target_bs)
+            target_seq += self.get_dp_padding(target_seq)
+            target_blocks += self.get_dp_padding(target_blocks)
 
         # NOTE: If model does not support multimodal inputs, we pad here.
         # For models with multimodal support, we may want to get embeddings
@@ -2483,25 +2487,39 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
-        with self.profiler.record_event('internal', model_event_name):
-            hidden_states = self.model.forward(input_ids=token_ids,
-                                               positions=position_ids,
-                                               attn_metadata=trimmed_attn_metadata,
-                                               kv_caches=kv_caches,
-                                               inputs_embeds=inputs_embeds,
-                                               model_mm_kwargs=model_mm_kwargs,
-                                               lora_mask=lora_mask,
-                                               **additional_kwargs)
-        # NOTE(kzawora): returning hidden_states is required in prompt logprobs
-        # scenarios, as they will do logit processing on their own
-        if self.use_aux_hidden_state_outputs:
-            non_flattened_hidden_states, aux_hidden_states = hidden_states
-            hidden_states = non_flattened_hidden_states
-        else:
-            non_flattened_hidden_states = hidden_states
-            aux_hidden_states = None
 
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        if has_kv_transfer_group(
+        ) and self.vllm_config.kv_transfer_config.kv_role == "kv_consumer" and trimmed_attn_metadata.is_prompt:
+            hidden_states = self.kv_caches[-1].unflatten(0, (-1, self.block_size)).index_select(
+                0, trimmed_attn_metadata.block_list)
+            non_flattened_hidden_states = hidden_states.view(batch_size, seq_len, -1)
+            aux_hidden_states = None
+        else:
+            with self.profiler.record_event('internal', model_event_name):
+                hidden_states = self.model.forward(input_ids=token_ids,
+                                                   positions=position_ids,
+                                                   attn_metadata=trimmed_attn_metadata,
+                                                   kv_caches=kv_caches,
+                                                   inputs_embeds=inputs_embeds,
+                                                   model_mm_kwargs=model_mm_kwargs,
+                                                   lora_mask=lora_mask,
+                                                   **additional_kwargs)
+            # NOTE(kzawora): returning hidden_states is required in prompt logprobs
+            # scenarios, as they will do logit processing on their own
+            if self.use_aux_hidden_state_outputs:
+                non_flattened_hidden_states, aux_hidden_states = hidden_states
+                hidden_states = non_flattened_hidden_states
+            else:
+                non_flattened_hidden_states = hidden_states
+                aux_hidden_states = None
+
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        if has_kv_transfer_group() and self.vllm_config.kv_transfer_config.kv_role == "kv_producer":
+            slot_mapping = trimmed_attn_metadata.slot_mapping.flatten(
+            ) if attn_metadata.slot_mapping is not None else None
+            self.kv_caches[-1].index_copy_(0, slot_mapping, hidden_states)
+
         hidden_states = hidden_states[logits_indices]
         LoraMask.setLoraMask(lora_logits_mask)
         with self.profiler.record_event('internal', ('compute_logits'
@@ -4408,6 +4426,11 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 layer_names.update(group.layer_names)
             assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
+        hidden_states_cache = torch.zeros((self.kv_caches[0][0].shape[0], self.hidden_size),
+                                          dtype=self.dtype,
+                                          device=self.device)
+        kv_caches["hidden_states_cache"] = (hidden_states_cache, None)
+        self.kv_caches.append(hidden_states_cache)
 
         if self.enable_bucketing:
             self.bucketing_manager.num_hpu_blocks = num_blocks
